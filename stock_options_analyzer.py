@@ -6,10 +6,20 @@ import numpy as np
 from datetime import datetime, timedelta
 import os
 import json
+import time
+import openai
 from market_data_engine import (
     analyze_stock_options,
     _data_cache,
     get_api_keys_from_secrets,
+)
+
+# Importar el módulo de autenticación
+from authenticator import (
+    check_password,
+    validate_session,
+    clear_session,
+    get_session_info,
 )
 
 # Configuración de página
@@ -198,14 +208,497 @@ st.markdown(
         box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
         border-color: #bbdefb;
     }
+    
+    /* Estilos para login */
+    .login-container {
+        max-width: 450px;
+        margin: 0 auto;
+        padding: 2rem;
+        background-color: #f8f9fa;
+        border-radius: 0.5rem;
+        box-shadow: 0 0.25rem 0.5rem rgba(0, 0, 0, 0.1);
+        text-align: center;
+    }
+    
+    .login-header {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #1E88E5;
+        margin-bottom: 1.5rem;
+    }
+    
+    .login-input {
+        margin-bottom: 1.5rem;
+    }
+    
+    .login-button {
+        width: 100%;
+        background-color: #1E88E5;
+        color: white;
+        padding: 0.5rem;
+        border-radius: 0.25rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background-color 0.3s ease;
+    }
+    
+    .login-button:hover {
+        background-color: #1565C0;
+    }
+    
+    .session-info {
+        font-size: 0.75rem;
+        color: #6c757d;
+        margin-top: 1rem;
+    }
+    
+    /* Estilos para el experto IA */
+    .expert-container {
+        background-color: #f5f5f5;
+        border-left: 5px solid #1E88E5;
+        padding: 1.5rem;
+        border-radius: 0.25rem;
+        margin: 1.5rem 0;
+    }
+    
+    .expert-header {
+        display: flex;
+        align-items: center;
+        margin-bottom: 1rem;
+    }
+    
+    .expert-avatar {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background-color: #1E88E5;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: bold;
+        margin-right: 1rem;
+    }
+    
+    .expert-title {
+        font-size: 1.2rem;
+        font-weight: 600;
+        color: #1E88E5;
+    }
+    
+    .expert-content {
+        font-size: 1rem;
+        line-height: 1.6;
+    }
+    
+    .expert-footer {
+        font-size: 0.8rem;
+        color: #6c757d;
+        margin-top: 1rem;
+        text-align: right;
+    }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 
+# Inicialización del cliente de OpenAI y variables de estado
+def init_openai_client():
+    """Inicializa el cliente de OpenAI y las variables de estado necesarias"""
+
+    # Intentar obtener la clave API y el ID del asistente desde secrets
+    try:
+        OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
+        ASSISTANT_ID = st.secrets.get("ASSISTANT_ID")
+    except:
+        OPENAI_API_KEY = None
+        ASSISTANT_ID = None
+
+    # Si no están disponibles en secrets, solicitarlos
+    if not OPENAI_API_KEY:
+        OPENAI_API_KEY = st.sidebar.text_input("OpenAI API Key", type="password")
+
+    if not ASSISTANT_ID:
+        ASSISTANT_ID = st.sidebar.text_input("Assistant ID", type="password")
+
+    # Si falta alguna credencial, mostrar error
+    if not OPENAI_API_KEY or not ASSISTANT_ID:
+        return None, None
+
+    # Configurar cliente OpenAI
+    openai.api_key = OPENAI_API_KEY
+
+    # Inicializar variables de estado para el thread
+    if "thread_id" not in st.session_state:
+        thread = openai.beta.threads.create()
+        st.session_state.thread_id = thread.id
+
+    return openai, ASSISTANT_ID
+
+
+def process_message_with_citations(message):
+    """Extrae y devuelve solo el texto del mensaje del asistente."""
+    if hasattr(message, "content") and len(message.content) > 0:
+        message_content = message.content[0]
+        if hasattr(message_content, "text"):
+            nested_text = message_content.text
+            if hasattr(nested_text, "value"):
+                return nested_text.value
+    return "No se pudo procesar el mensaje"
+
+
+def consult_expert_ia(client, assistant_id, recommendation, symbol):
+    """Consulta al experto de IA con toda la información del análisis"""
+    if not client or not assistant_id:
+        return "Error: No se ha configurado correctamente el Experto IA. Por favor, verifica las credenciales de OpenAI."
+
+    # Formatear la información del análisis como un mensaje
+    prompt = f"""
+    Por favor, analiza el siguiente activo financiero y proporciona tu opinión profesional:
+    
+    Símbolo: {symbol}
+    
+    Datos técnicos:
+    - Recomendación: {recommendation.get('recommendation')}
+    - Confianza: {recommendation.get('confidence')}
+    - Score: {recommendation.get('score')}%
+    - Horizonte temporal: {recommendation.get('timeframe')}
+    
+    Factores técnicos:
+    {json.dumps(recommendation.get('technical_factors', {}), indent=2)}
+    
+    Factores fundamentales:
+    {json.dumps(recommendation.get('fundamental_factors', {}), indent=2)}
+    
+    Análisis de sentimiento:
+    {json.dumps(recommendation.get('news_sentiment', {}), indent=2)}
+    
+    Análisis web:
+    {json.dumps(recommendation.get('web_analysis', {}), indent=2)}
+    
+    Por favor proporciona:
+    1. Tu evaluación del activo considerando todos los aspectos (técnico, fundamental y sentimiento)
+    2. Tu recomendación de trading con horizonte temporal
+    3. Estrategias específicas con opciones que recomendarías
+    4. Riesgos a vigilar y niveles clave para stop loss
+    5. Tu proyección de movimiento
+    """
+
+    try:
+        # Enviar mensaje al thread
+        client.beta.threads.messages.create(
+            thread_id=st.session_state.thread_id, role="user", content=prompt
+        )
+
+        # Crear una ejecución para el thread
+        run = client.beta.threads.runs.create(
+            thread_id=st.session_state.thread_id, assistant_id=assistant_id
+        )
+
+        # Esperar a que se complete la ejecución
+        while run.status != "completed":
+            time.sleep(1)
+            run = client.beta.threads.runs.retrieve(
+                thread_id=st.session_state.thread_id, run_id=run.id
+            )
+
+            if run.status in ["failed", "cancelled", "expired"]:
+                return f"Error: La consulta al experto falló con estado {run.status}"
+
+        # Recuperar mensajes agregados por el asistente
+        messages = client.beta.threads.messages.list(
+            thread_id=st.session_state.thread_id
+        )
+
+        # Obtener la respuesta del asistente
+        for message in messages:
+            if message.run_id == run.id and message.role == "assistant":
+                return process_message_with_citations(message)
+
+        return "No se recibió respuesta del experto."
+
+    except Exception as e:
+        return f"Error al consultar al experto: {str(e)}"
+
+
+def detect_support_resistance(df, window=20, threshold=0.03):
+    """
+    Detecta niveles de soporte y resistencia en un DataFrame de precios
+
+    Args:
+        df: DataFrame con datos de precios
+        window: Ventana para detectar máximos y mínimos locales
+        threshold: Umbral para agrupar niveles similares (% del precio)
+
+    Returns:
+        supports: Lista de niveles de soporte
+        resistances: Lista de niveles de resistencia
+    """
+    supports = []
+    resistances = []
+
+    # Asegurarse de que el DataFrame tiene suficientes datos
+    if len(df) < window * 2:
+        return supports, resistances
+
+    # Encontrar mínimos locales (soportes potenciales)
+    for i in range(window, len(df) - window):
+        is_min = True
+        for j in range(i - window, i + window + 1):
+            if j == i:
+                continue
+            if j < 0 or j >= len(df):
+                continue
+            if df["Low"].iloc[j] <= df["Low"].iloc[i]:
+                is_min = False
+                break
+
+        if is_min:
+            support_level = df["Low"].iloc[i]
+
+            # Verificar si este nivel está cerca de uno ya detectado
+            add_level = True
+            for level in supports:
+                if abs(level - support_level) / support_level < threshold:
+                    add_level = False
+                    break
+
+            if add_level:
+                supports.append(support_level)
+
+    # Encontrar máximos locales (resistencias potenciales)
+    for i in range(window, len(df) - window):
+        is_max = True
+        for j in range(i - window, i + window + 1):
+            if j == i:
+                continue
+            if j < 0 or j >= len(df):
+                continue
+            if df["High"].iloc[j] >= df["High"].iloc[i]:
+                is_max = False
+                break
+
+        if is_max:
+            resistance_level = df["High"].iloc[i]
+
+            # Verificar si este nivel está cerca de uno ya detectado
+            add_level = True
+            for level in resistances:
+                if abs(level - resistance_level) / resistance_level < threshold:
+                    add_level = False
+                    break
+
+            if add_level:
+                resistances.append(resistance_level)
+
+    # Limitar a los 5 niveles más recientes
+    supports = sorted(supports)[-5:] if supports else []
+    resistances = sorted(resistances)[-5:] if resistances else []
+
+    return supports, resistances
+
+
+def detect_trend_lines(df, min_points=5):
+    """
+    Detecta líneas de tendencia alcistas y bajistas en un DataFrame de precios
+
+    Args:
+        df: DataFrame con datos de precios
+        min_points: Número mínimo de puntos para formar una línea de tendencia
+
+    Returns:
+        bullish_lines: Lista de líneas de tendencia alcistas [(x1,y1,x2,y2),...]
+        bearish_lines: Lista de líneas de tendencia bajistas [(x1,y1,x2,y2),...]
+    """
+    bullish_lines = []
+    bearish_lines = []
+
+    # Asegurarse de que el DataFrame tiene suficientes datos
+    if len(df) < min_points * 2:
+        return bullish_lines, bearish_lines
+
+    # Para líneas de tendencia alcistas (conectar mínimos)
+    lows = [(i, df["Low"].iloc[i]) for i in range(len(df))]
+
+    # Detectar potenciales puntos de pivote para los mínimos
+    pivot_lows = []
+    for i in range(1, len(df) - 1):
+        if (
+            df["Low"].iloc[i] < df["Low"].iloc[i - 1]
+            and df["Low"].iloc[i] < df["Low"].iloc[i + 1]
+        ):
+            pivot_lows.append((i, df["Low"].iloc[i]))
+
+    # Encontrar líneas de tendencia alcistas
+    for i in range(len(pivot_lows) - 1):
+        for j in range(i + 1, len(pivot_lows)):
+            # Calcular pendiente
+            x1, y1 = pivot_lows[i]
+            x2, y2 = pivot_lows[j]
+
+            if x2 <= x1:
+                continue
+
+            slope = (y2 - y1) / (x2 - x1)
+
+            # Una línea de tendencia alcista debe tener pendiente positiva
+            if slope <= 0:
+                points_above = 0
+                all_points = 0
+
+                # Verificar puntos entre estos dos pivotes
+                for k in range(x1 + 1, x2):
+                    expected_y = y1 + slope * (k - x1)
+                    actual_y = df["Low"].iloc[k]
+                    all_points += 1
+
+                    if actual_y >= expected_y:
+                        points_above += 1
+
+                # Si al menos el 80% de los puntos están por encima, es una línea de tendencia válida
+                if all_points > 0 and points_above / all_points >= 0.8:
+                    bullish_lines.append((x1, y1, x2, y2))
+
+    # Para líneas de tendencia bajistas (conectar máximos)
+    highs = [(i, df["High"].iloc[i]) for i in range(len(df))]
+
+    # Detectar potenciales puntos de pivote para los máximos
+    pivot_highs = []
+    for i in range(1, len(df) - 1):
+        if (
+            df["High"].iloc[i] > df["High"].iloc[i - 1]
+            and df["High"].iloc[i] > df["High"].iloc[i + 1]
+        ):
+            pivot_highs.append((i, df["High"].iloc[i]))
+
+    # Encontrar líneas de tendencia bajistas
+    for i in range(len(pivot_highs) - 1):
+        for j in range(i + 1, len(pivot_highs)):
+            # Calcular pendiente
+            x1, y1 = pivot_highs[i]
+            x2, y2 = pivot_highs[j]
+
+            if x2 <= x1:
+                continue
+
+            slope = (y2 - y1) / (x2 - x1)
+
+            # Una línea de tendencia bajista debe tener pendiente negativa
+            if slope >= 0:
+                points_below = 0
+                all_points = 0
+
+                # Verificar puntos entre estos dos pivotes
+                for k in range(x1 + 1, x2):
+                    expected_y = y1 + slope * (k - x1)
+                    actual_y = df["High"].iloc[k]
+                    all_points += 1
+
+                    if actual_y <= expected_y:
+                        points_below += 1
+
+                # Si al menos el 80% de los puntos están por debajo, es una línea de tendencia válida
+                if all_points > 0 and points_below / all_points >= 0.8:
+                    bearish_lines.append((x1, y1, x2, y2))
+
+    # Limitar a las 3 líneas más recientes
+    bullish_lines = (
+        sorted(bullish_lines, key=lambda x: x[2])[-3:] if bullish_lines else []
+    )
+    bearish_lines = (
+        sorted(bearish_lines, key=lambda x: x[2])[-3:] if bearish_lines else []
+    )
+
+    return bullish_lines, bearish_lines
+
+
+def detect_channels(df, bullish_lines, bearish_lines):
+    """
+    Detecta canales de precio basados en líneas de tendencia
+
+    Args:
+        df: DataFrame con datos de precios
+        bullish_lines: Líneas de tendencia alcistas
+        bearish_lines: Líneas de tendencia bajistas
+
+    Returns:
+        channels: Lista de canales [(bullish_line, parallel_line),...]
+    """
+    channels = []
+
+    # Detectar canales alcistas
+    for line in bullish_lines:
+        x1, y1, x2, y2 = line
+        slope = (y2 - y1) / (x2 - x1)
+
+        # Calcular los puntos máximos por encima de la línea
+        max_distance = 0
+        max_point = None
+
+        for i in range(x1, x2 + 1):
+            if i >= len(df):
+                continue
+
+            base_y = y1 + slope * (i - x1)
+            distance = df["High"].iloc[i] - base_y
+
+            if distance > max_distance:
+                max_distance = distance
+                max_point = (i, df["High"].iloc[i])
+
+        if max_point and max_distance > 0:
+            # Crear línea paralela en la parte superior
+            mx, my = max_point
+
+            # Puntos de la línea paralela superior
+            px1 = x1
+            py1 = y1 + max_distance
+            px2 = x2
+            py2 = y2 + max_distance
+
+            channels.append((line, (px1, py1, px2, py2), "bullish"))
+
+    # Detectar canales bajistas
+    for line in bearish_lines:
+        x1, y1, x2, y2 = line
+        slope = (y2 - y1) / (x2 - x1)
+
+        # Calcular los puntos mínimos por debajo de la línea
+        max_distance = 0
+        max_point = None
+
+        for i in range(x1, x2 + 1):
+            if i >= len(df):
+                continue
+
+            base_y = y1 + slope * (i - x1)
+            distance = base_y - df["Low"].iloc[i]
+
+            if distance > max_distance:
+                max_distance = distance
+                max_point = (i, df["Low"].iloc[i])
+
+        if max_point and max_distance > 0:
+            # Crear línea paralela en la parte inferior
+            mx, my = max_point
+
+            # Puntos de la línea paralela inferior
+            px1 = x1
+            py1 = y1 - max_distance
+            px2 = x2
+            py2 = y2 - max_distance
+
+            channels.append((line, (px1, py1, px2, py2), "bearish"))
+
+    # Limitar a los 2 canales más recientes
+    channels = sorted(channels, key=lambda x: x[0][2])[-2:] if channels else []
+
+    return channels
+
+
 def create_technical_chart(data):
-    """Crea gráfico técnico con indicadores"""
+    """Crea gráfico técnico con indicadores y patrones técnicos"""
     # Corregido: verificación adecuada de DataFrame vacío
     if (
         data is None
@@ -353,11 +846,207 @@ def create_technical_chart(data):
                 col=1,
             )
 
+    # Detectar soportes y resistencias
+    supports, resistances = detect_support_resistance(df)
+
+    # Añadir líneas de soporte
+    for level in supports:
+        fig.add_shape(
+            type="line",
+            x0=df["Date"].iloc[0] if "Date" in df.columns else df.index[0],
+            x1=df["Date"].iloc[-1] if "Date" in df.columns else df.index[-1],
+            y0=level,
+            y1=level,
+            line=dict(color="rgba(0, 128, 0, 0.7)", width=1, dash="dot"),
+            row=1,
+            col=1,
+        )
+
+        # Añadir etiqueta
+        fig.add_annotation(
+            x=df["Date"].iloc[-1] if "Date" in df.columns else df.index[-1],
+            y=level,
+            text=f"Soporte: {level:.2f}",
+            showarrow=False,
+            xshift=10,
+            font=dict(color="rgba(0, 128, 0, 1)"),
+            row=1,
+            col=1,
+        )
+
+    # Añadir líneas de resistencia
+    for level in resistances:
+        fig.add_shape(
+            type="line",
+            x0=df["Date"].iloc[0] if "Date" in df.columns else df.index[0],
+            x1=df["Date"].iloc[-1] if "Date" in df.columns else df.index[-1],
+            y0=level,
+            y1=level,
+            line=dict(color="rgba(255, 0, 0, 0.7)", width=1, dash="dot"),
+            row=1,
+            col=1,
+        )
+
+        # Añadir etiqueta
+        fig.add_annotation(
+            x=df["Date"].iloc[-1] if "Date" in df.columns else df.index[-1],
+            y=level,
+            text=f"Resistencia: {level:.2f}",
+            showarrow=False,
+            xshift=10,
+            font=dict(color="rgba(255, 0, 0, 1)"),
+            row=1,
+            col=1,
+        )
+
+    # Detectar líneas de tendencia
+    if "Date" in df.columns:
+        # Si hay fechas, convertir a índices numéricos para cálculos de tendencia
+        df_idx = df.copy()
+        df_idx["idx"] = range(len(df))
+        bullish_lines, bearish_lines = detect_trend_lines(df_idx)
+
+        # Convertir índices de vuelta a fechas
+        bullish_lines_dates = [
+            (df["Date"].iloc[x1], y1, df["Date"].iloc[x2], y2)
+            for x1, y1, x2, y2 in bullish_lines
+            if x1 < len(df) and x2 < len(df)
+        ]
+
+        bearish_lines_dates = [
+            (df["Date"].iloc[x1], y1, df["Date"].iloc[x2], y2)
+            for x1, y1, x2, y2 in bearish_lines
+            if x1 < len(df) and x2 < len(df)
+        ]
+    else:
+        # Usar índices directamente
+        bullish_lines, bearish_lines = detect_trend_lines(df)
+        bullish_lines_dates = [
+            (df.index[x1], y1, df.index[x2], y2)
+            for x1, y1, x2, y2 in bullish_lines
+            if x1 < len(df) and x2 < len(df)
+        ]
+
+        bearish_lines_dates = [
+            (df.index[x1], y1, df.index[x2], y2)
+            for x1, y1, x2, y2 in bearish_lines
+            if x1 < len(df) and x2 < len(df)
+        ]
+
+    # Añadir líneas de tendencia alcistas
+    for i, (x1, y1, x2, y2) in enumerate(bullish_lines_dates):
+        fig.add_shape(
+            type="line",
+            x0=x1,
+            y0=y1,
+            x1=x2,
+            y1=y2,
+            line=dict(color="rgba(0, 128, 0, 0.7)", width=2),
+            row=1,
+            col=1,
+        )
+
+        # Añadir etiqueta
+        fig.add_annotation(
+            x=x2,
+            y=y2,
+            text=f"Tendencia Alcista",
+            showarrow=True,
+            arrowhead=1,
+            ax=20,
+            ay=-30,
+            font=dict(color="rgba(0, 128, 0, 1)"),
+            row=1,
+            col=1,
+        )
+
+    # Añadir líneas de tendencia bajistas
+    for i, (x1, y1, x2, y2) in enumerate(bearish_lines_dates):
+        fig.add_shape(
+            type="line",
+            x0=x1,
+            y0=y1,
+            x1=x2,
+            y1=y2,
+            line=dict(color="rgba(255, 0, 0, 0.7)", width=2),
+            row=1,
+            col=1,
+        )
+
+        # Añadir etiqueta
+        fig.add_annotation(
+            x=x2,
+            y=y2,
+            text=f"Tendencia Bajista",
+            showarrow=True,
+            arrowhead=1,
+            ax=20,
+            ay=30,
+            font=dict(color="rgba(255, 0, 0, 1)"),
+            row=1,
+            col=1,
+        )
+
+    # Detectar canales
+    channels = detect_channels(df, bullish_lines, bearish_lines)
+
+    # Añadir canales
+    for trendline, parallel_line, channel_type in channels:
+        x1, y1, x2, y2 = parallel_line
+
+        if "Date" in df.columns:
+            # Convertir índices a fechas
+            if x1 < len(df) and x2 < len(df):
+                x1_date = df["Date"].iloc[x1]
+                x2_date = df["Date"].iloc[x2]
+            else:
+                continue
+        else:
+            # Usar índices directamente si están dentro del rango
+            if x1 < len(df.index) and x2 < len(df.index):
+                x1_date = df.index[x1]
+                x2_date = df.index[x2]
+            else:
+                continue
+
+        # Color según tipo de canal
+        color = (
+            "rgba(0, 128, 0, 0.7)"
+            if channel_type == "bullish"
+            else "rgba(255, 0, 0, 0.7)"
+        )
+
+        fig.add_shape(
+            type="line",
+            x0=x1_date,
+            y0=y1,
+            x1=x2_date,
+            y1=y2,
+            line=dict(color=color, width=2, dash="dot"),
+            row=1,
+            col=1,
+        )
+
+        # Añadir etiqueta
+        channel_name = "Canal Alcista" if channel_type == "bullish" else "Canal Bajista"
+        fig.add_annotation(
+            x=x2_date,
+            y=y2,
+            text=channel_name,
+            showarrow=True,
+            arrowhead=1,
+            ax=40,
+            ay=-30 if channel_type == "bullish" else 30,
+            font=dict(color=color),
+            row=1,
+            col=1,
+        )
+
     # Ajustar layout
     fig.update_layout(
         height=800,
         xaxis_rangeslider_visible=False,
-        title=f"Análisis Técnico",
+        title=f"Análisis Técnico con Patrones",
         template="plotly_white",
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -464,6 +1153,32 @@ def display_recommendation_summary(recommendation):
             <p>Probabilidad de éxito: <strong>{int((100-abs(score-50))*0.9)}%</strong></p>
             <p>Perfil de riesgo: <span class="{risk_class}">{risk_level.upper()}</span></p>
             <p>Estrategia recomendada: <strong>{strategy_type}</strong></p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def display_expert_opinion(expert_opinion):
+    """Muestra la opinión del experto IA"""
+    if not expert_opinion:
+        return
+
+    st.markdown("## 🧠 Análisis del Experto")
+
+    st.markdown(
+        f"""
+        <div class="expert-container">
+            <div class="expert-header">
+                <div class="expert-avatar">E</div>
+                <div class="expert-title">Analista de Mercados</div>
+            </div>
+            <div class="expert-content">
+                {expert_opinion}
+            </div>
+            <div class="expert-footer">
+                Análisis generado por IA - {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1013,212 +1728,294 @@ def display_disclaimer():
     )
 
 
-def main():
-    """Función principal"""
+def display_login_form():
+    """Muestra formulario de login"""
     st.markdown(
-        '<h1 class="main-header">MarketIntel: Análisis Avanzado de Opciones</h1>',
+        """
+        <div class="login-container">
+            <div class="login-header">MarketIntel Trader</div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
-    # Sidebar - Configuración
-    st.sidebar.title("⚙️ Configuración")
+    # Crear un formulario de login centrado
+    login_form = st.form(key="login_form")
 
-    # Input para API keys con integración de secrets.toml
-    with st.sidebar.expander("🔑 Claves API"):
-        # Cargar claves desde secrets.toml
-        api_keys = get_api_keys_from_secrets()
+    with login_form:
+        st.markdown("<h3>Acceso al Sistema</h3>", unsafe_allow_html=True)
+        password = st.text_input("Contraseña", type="password")
+        submit_button = st.form_submit_button(label="Ingresar")
 
-        # Mostrar estado actual de las claves API
-        you_status = "✅ Configurada" if "you" in api_keys else "❌ No configurada"
-        tavily_status = (
-            "✅ Configurada" if "tavily" in api_keys else "❌ No configurada"
-        )
+    if submit_button:
+        if check_password(password):
+            st.session_state.authenticated = True
+            st.session_state.last_successful_auth = datetime.now()
+            st.success("Autenticación exitosa!")
+            st.rerun()  # Recargar la página para mostrar el contenido principal
+        # El mensaje de error lo maneja la función check_password internamente
 
-        # APIs adicionales
-        alpha_vantage_status = (
-            "✅ Configurada" if "alpha_vantage" in api_keys else "❌ No configurada"
-        )
-        finnhub_status = (
-            "✅ Configurada" if "finnhub" in api_keys else "❌ No configurada"
-        )
-        marketstack_status = (
-            "✅ Configurada" if "marketstack" in api_keys else "❌ No configurada"
-        )
 
-        st.markdown(f"**YOU API:** {you_status}")
-        st.markdown(f"**Tavily API:** {tavily_status}")
-        st.markdown(f"**Alpha Vantage API:** {alpha_vantage_status}")
-        st.markdown(f"**Finnhub API:** {finnhub_status}")
-        st.markdown(f"**MarketStack API:** {marketstack_status}")
+def display_session_info():
+    """Muestra información de sesión en la barra lateral"""
+    session_info = get_session_info()
 
-        # Permitir sobrescribir desde la UI
-        st.markdown("---")
-        st.markdown("**Sobrescribir claves (opcional):**")
-        you_key = st.text_input("YOU API Key", type="password")
-        tavily_key = st.text_input("Tavily API Key", type="password")
-        alpha_vantage_key = st.text_input("Alpha Vantage API Key", type="password")
-        finnhub_key = st.text_input("Finnhub API Key", type="password")
+    if session_info["authenticated"]:
+        st.sidebar.markdown("### 👤 Información de Sesión")
+        st.sidebar.text(f"Estado: Autenticado")
 
-        # Sobrescribir si se ingresa algo
-        if you_key:
-            api_keys["you"] = you_key
-        if tavily_key:
-            api_keys["tavily"] = tavily_key
-        if alpha_vantage_key:
-            api_keys["alpha_vantage"] = alpha_vantage_key
-        if finnhub_key:
-            api_keys["finnhub"] = finnhub_key
+        # Mostrar hora de inicio de sesión
+        if session_info["last_auth"]:
+            login_time = session_info["last_auth"].strftime("%d/%m/%Y %H:%M:%S")
+            st.sidebar.text(f"Inicio: {login_time}")
 
-        # Mostrar instrucciones si no hay claves configuradas
-        if not api_keys:
-            st.info(
-                """
-            Para un análisis más completo, configura tus claves API:
-            1. Edita el archivo `.streamlit/secrets.toml`
-            2. Agrega tus claves en la sección [api_keys]
-            3. O ingresa las claves directamente aquí
-            """
+            # Calcular tiempo restante de sesión
+            session_expiry = session_info["last_auth"] + timedelta(hours=8)
+            remaining = session_expiry - datetime.now()
+            remaining_hours = remaining.seconds // 3600
+            remaining_minutes = (remaining.seconds % 3600) // 60
+
+            st.sidebar.text(
+                f"Sesión válida por: {remaining_hours}h {remaining_minutes}m"
             )
 
-    # Selección de símbolo por categoría
-    st.markdown("### Seleccionar Instrumento")
-    col1, col2 = st.columns(2)
+        # Botón para cerrar sesión
+        if st.sidebar.button("🚪 Cerrar Sesión"):
+            clear_session()
+            st.rerun()
 
-    with col1:
-        categoria = st.selectbox(
-            "Categoría",
-            options=list(SYMBOLS.keys()),
-            index=1,  # Por defecto selecciona Tecnología
+
+def main():
+    """Función principal"""
+    # Comprobar si ya existe una sesión autenticada y válida
+    if not validate_session():
+        display_login_form()
+    else:
+        # Inicializar cliente OpenAI
+        openai_client, assistant_id = init_openai_client()
+
+        # Mostrar la aplicación principal
+        st.markdown(
+            '<h1 class="main-header">MarketIntel: Análisis Avanzado de Opciones</h1>',
+            unsafe_allow_html=True,
         )
 
-    with col2:
-        symbol = st.selectbox(
-            "Símbolo",
-            options=SYMBOLS[categoria],
-            index=0,  # Por defecto selecciona el primer símbolo de la categoría
-        )
+        # Mostrar información de sesión en la barra lateral
+        display_session_info()
 
-    # Opción para entrada manual
-    usar_simbolo_personalizado = st.checkbox("Usar símbolo personalizado")
-    if usar_simbolo_personalizado:
-        simbolo_custom = st.text_input("Ingresa símbolo personalizado", "").upper()
-        if simbolo_custom:
-            symbol = simbolo_custom
+        # Sidebar - Configuración
+        st.sidebar.title("⚙️ Configuración")
 
-    # Opciones avanzadas de análisis
-    with st.expander("⚙️ Opciones avanzadas de análisis"):
+        # Input para API keys con integración de secrets.toml
+        with st.sidebar.expander("🔑 Claves API"):
+            # Cargar claves desde secrets.toml
+            api_keys = get_api_keys_from_secrets()
+
+            # Mostrar estado actual de las claves API
+            you_status = "✅ Configurada" if "you" in api_keys else "❌ No configurada"
+            tavily_status = (
+                "✅ Configurada" if "tavily" in api_keys else "❌ No configurada"
+            )
+
+            # APIs adicionales
+            alpha_vantage_status = (
+                "✅ Configurada" if "alpha_vantage" in api_keys else "❌ No configurada"
+            )
+            finnhub_status = (
+                "✅ Configurada" if "finnhub" in api_keys else "❌ No configurada"
+            )
+            marketstack_status = (
+                "✅ Configurada" if "marketstack" in api_keys else "❌ No configurada"
+            )
+
+            st.markdown(f"**YOU API:** {you_status}")
+            st.markdown(f"**Tavily API:** {tavily_status}")
+            st.markdown(f"**Alpha Vantage API:** {alpha_vantage_status}")
+            st.markdown(f"**Finnhub API:** {finnhub_status}")
+            st.markdown(f"**MarketStack API:** {marketstack_status}")
+
+            # Permitir sobrescribir desde la UI
+            st.markdown("---")
+            st.markdown("**Sobrescribir claves (opcional):**")
+            you_key = st.text_input("YOU API Key", type="password")
+            tavily_key = st.text_input("Tavily API Key", type="password")
+            alpha_vantage_key = st.text_input("Alpha Vantage API Key", type="password")
+            finnhub_key = st.text_input("Finnhub API Key", type="password")
+
+            # Sobrescribir si se ingresa algo
+            if you_key:
+                api_keys["you"] = you_key
+            if tavily_key:
+                api_keys["tavily"] = tavily_key
+            if alpha_vantage_key:
+                api_keys["alpha_vantage"] = alpha_vantage_key
+            if finnhub_key:
+                api_keys["finnhub"] = finnhub_key
+
+            # Mostrar instrucciones si no hay claves configuradas
+            if not api_keys:
+                st.info(
+                    """
+                Para un análisis más completo, configura tus claves API:
+                1. Edita el archivo `.streamlit/secrets.toml`
+                2. Agrega tus claves en la sección [api_keys]
+                3. O ingresa las claves directamente aquí
+                """
+                )
+
+        # Selección de símbolo por categoría
+        st.markdown("### Seleccionar Instrumento")
         col1, col2 = st.columns(2)
 
         with col1:
-            periodo_historico = st.selectbox(
-                "Período histórico",
-                options=["1mo", "3mo", "6mo", "1y", "2y", "5y"],
-                index=2,  # 6mo por defecto
+            categoria = st.selectbox(
+                "Categoría",
+                options=list(SYMBOLS.keys()),
+                index=1,  # Por defecto selecciona Tecnología
             )
 
         with col2:
-            intervalo_datos = st.selectbox(
-                "Intervalo de datos",
-                options=["1d", "1h", "30m", "15m", "5m", "1m", "1wk", "1mo"],
-                index=0,  # 1d por defecto
+            symbol = st.selectbox(
+                "Símbolo",
+                options=SYMBOLS[categoria],
+                index=0,  # Por defecto selecciona el primer símbolo de la categoría
             )
 
-        usar_datos_intraday = st.checkbox("Usar datos intraday", value=False)
-        if usar_datos_intraday and intervalo_datos == "1d":
-            intervalo_datos = "1h"
-            st.info("Se ha cambiado el intervalo a 1h para datos intraday")
+        # Opción para entrada manual
+        usar_simbolo_personalizado = st.checkbox("Usar símbolo personalizado")
+        if usar_simbolo_personalizado:
+            simbolo_custom = st.text_input("Ingresa símbolo personalizado", "").upper()
+            if simbolo_custom:
+                symbol = simbolo_custom
 
-    # Botón de análisis
-    analyze_button = st.button(
-        "🔍 Analizar Opciones", type="primary", use_container_width=True
-    )
+        # Opciones avanzadas de análisis
+        with st.expander("⚙️ Opciones avanzadas de análisis"):
+            col1, col2 = st.columns(2)
 
-    if analyze_button and symbol:
-        with st.spinner(f"Analizando {symbol}... Esto puede tomar un momento"):
-            # Realizar análisis
-            recommendation = analyze_stock_options(symbol, api_keys)
-
-            if recommendation.get("recommendation") == "ERROR":
-                st.error(f"Error al analizar {symbol}: {recommendation.get('error')}")
-            else:
-                # Mostrar análisis dividido en secciones
-
-                # 1. Resumen de recomendación
-                display_recommendation_summary(recommendation)
-
-                # 2. Gráfico técnico
-                st.markdown(
-                    '<div class="sub-header">Análisis Técnico</div>',
-                    unsafe_allow_html=True,
+            with col1:
+                periodo_historico = st.selectbox(
+                    "Período histórico",
+                    options=["1mo", "3mo", "6mo", "1y", "2y", "5y"],
+                    index=2,  # 6mo por defecto
                 )
-                chart_data = pd.DataFrame(recommendation.get("chart_data", []))
-                if not chart_data.empty:
-                    fig = create_technical_chart(chart_data)
-                    if fig:
-                        st.plotly_chart(fig, use_container_width=True)
+
+            with col2:
+                intervalo_datos = st.selectbox(
+                    "Intervalo de datos",
+                    options=["1d", "1h", "30m", "15m", "5m", "1m", "1wk", "1mo"],
+                    index=0,  # 1d por defecto
+                )
+
+            usar_datos_intraday = st.checkbox("Usar datos intraday", value=False)
+            if usar_datos_intraday and intervalo_datos == "1d":
+                intervalo_datos = "1h"
+                st.info("Se ha cambiado el intervalo a 1h para datos intraday")
+
+        # Botón de análisis
+        analyze_button = st.button(
+            "🔍 Analizar Opciones", type="primary", use_container_width=True
+        )
+
+        if analyze_button and symbol:
+            with st.spinner(f"Analizando {symbol}... Esto puede tomar un momento"):
+                # Realizar análisis
+                recommendation = analyze_stock_options(symbol, api_keys)
+
+                if recommendation.get("recommendation") == "ERROR":
+                    st.error(
+                        f"Error al analizar {symbol}: {recommendation.get('error')}"
+                    )
                 else:
-                    st.warning("No hay datos técnicos disponibles para visualización.")
+                    # 1. Resumen de recomendación
+                    display_recommendation_summary(recommendation)
 
-                # 3. Estrategias de trading recomendadas (nueva sección)
-                display_trading_strategies(recommendation)
+                    # 2. Gráfico técnico
+                    st.markdown(
+                        '<div class="sub-header">Análisis Técnico</div>',
+                        unsafe_allow_html=True,
+                    )
+                    chart_data = pd.DataFrame(recommendation.get("chart_data", []))
+                    if not chart_data.empty:
+                        fig = create_technical_chart(chart_data)
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.warning(
+                            "No hay datos técnicos disponibles para visualización."
+                        )
 
-                # Crear pestañas para el resto del análisis
-                tab1, tab2, tab3 = st.tabs(
-                    [
-                        "📊 Análisis Fundamental",
-                        "📰 Noticias y Sentimiento",
-                        "🌐 Insights Web",
-                    ]
-                )
+                    # 3. Consultar al experto IA
+                    with st.spinner("Consultando al experto..."):
+                        if openai_client and assistant_id:
+                            expert_opinion = consult_expert_ia(
+                                openai_client, assistant_id, recommendation, symbol
+                            )
+                            display_expert_opinion(expert_opinion)
+                        else:
+                            st.warning(
+                                "El experto IA no está disponible. Verifica las credenciales de OpenAI."
+                            )
 
-                with tab1:
-                    col1, col2 = st.columns(2)
+                    # 4. Estrategias de trading recomendadas
+                    display_trading_strategies(recommendation)
 
-                    with col1:
-                        # 4. Factores técnicos
-                        display_technical_factors(recommendation)
+                    # Crear pestañas para el resto del análisis
+                    tab1, tab2, tab3 = st.tabs(
+                        [
+                            "📊 Análisis Fundamental",
+                            "📰 Noticias y Sentimiento",
+                            "🌐 Insights Web",
+                        ]
+                    )
 
-                    with col2:
-                        # 5. Factores fundamentales
-                        display_fundamental_factors(recommendation)
+                    with tab1:
+                        col1, col2 = st.columns(2)
 
-                with tab2:
-                    col1, col2 = st.columns(2)
+                        with col1:
+                            # Factores técnicos
+                            display_technical_factors(recommendation)
 
-                    with col1:
-                        # 6. Análisis de sentimiento
-                        display_sentiment_analysis(recommendation)
+                        with col2:
+                            # Factores fundamentales
+                            display_fundamental_factors(recommendation)
 
-                    with col2:
-                        # 7. Feed de noticias
-                        display_news_feed(recommendation)
+                    with tab2:
+                        col1, col2 = st.columns(2)
 
-                with tab3:
-                    # 8. Insights web
-                    display_web_insights(recommendation)
+                        with col1:
+                            # Análisis de sentimiento
+                            display_sentiment_analysis(recommendation)
 
-                # Mostrar fecha de último análisis
-                st.caption(
-                    f"Análisis actualizado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
-                )
+                        with col2:
+                            # Feed de noticias
+                            display_news_feed(recommendation)
 
-    # Mostrar estadísticas de caché
-    display_cache_stats()
+                    with tab3:
+                        # Insights web
+                        display_web_insights(recommendation)
 
-    # Mostrar disclaimer
-    display_disclaimer()
+                    # Mostrar fecha de último análisis
+                    st.caption(
+                        f"Análisis actualizado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+                    )
 
-    # Pie de página
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(
+        # Mostrar estadísticas de caché
+        display_cache_stats()
+
+        # Mostrar disclaimer
+        display_disclaimer()
+
+        # Pie de página
+        st.sidebar.markdown("---")
+        st.sidebar.markdown(
+            """
+        ### 👨‍💻 Desarrollado por
+        
+        [Trading & Analysis Specialist](https://github.com)
+        
+        **Versión:** 1.0.1
         """
-    ### 👨‍💻 Desarrollado por
-    
-    [Trading & Analysis Specialist](https://github.com)
-    
-    **Versión:** 1.0.1
-    """
-    )
+        )
 
 
 if __name__ == "__main__":
