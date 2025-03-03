@@ -22,6 +22,22 @@ from authenticator import (
     get_session_info,
 )
 
+
+class NumpyEncoder(json.JSONEncoder):
+    """Encoder personalizado para manejar tipos de datos NumPy en la serialización JSON"""
+
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        return super(NumpyEncoder, self).default(obj)
+
+
 # Configuración de página
 st.set_page_config(
     page_title="MarketIntel Options Analyzer",
@@ -307,34 +323,79 @@ st.markdown(
 def init_openai_client():
     """Inicializa el cliente de OpenAI y las variables de estado necesarias"""
 
-    # Intentar obtener la clave API y el ID del asistente desde secrets
-    try:
-        OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
-        ASSISTANT_ID = st.secrets.get("ASSISTANT_ID")
-    except:
-        OPENAI_API_KEY = None
-        ASSISTANT_ID = None
+    # Intentar todas las posibles ubicaciones de las credenciales
+    OPENAI_API_KEY = None
+    ASSISTANT_ID = None
 
-    # Si no están disponibles en secrets, solicitarlos
+    try:
+        # 1. Buscar en el nivel principal del secrets
+        if "OPENAI_API_KEY" in st.secrets:
+            OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+            st.sidebar.success("✅ OPENAI_API_KEY encontrada en nivel principal")
+
+        if "ASSISTANT_ID" in st.secrets:
+            ASSISTANT_ID = st.secrets["ASSISTANT_ID"]
+            st.sidebar.success("✅ ASSISTANT_ID encontrado en nivel principal")
+
+        # 2. Buscar en la sección api_keys
+        if not OPENAI_API_KEY and "api_keys" in st.secrets:
+            if "OPENAI_API_KEY" in st.secrets["api_keys"]:
+                OPENAI_API_KEY = st.secrets["api_keys"]["OPENAI_API_KEY"]
+                st.sidebar.success("✅ OPENAI_API_KEY encontrada en api_keys")
+
+            if "ASSISTANT_ID" in st.secrets["api_keys"]:
+                ASSISTANT_ID = st.secrets["api_keys"]["ASSISTANT_ID"]
+                st.sidebar.success("✅ ASSISTANT_ID encontrado en api_keys")
+
+        # 3. Verificar con nombres alternativos
+        if not OPENAI_API_KEY:
+            alternative_keys = ["openai_api_key", "OpenAIAPIKey", "OPENAI_KEY"]
+            for key in alternative_keys:
+                if key in st.secrets:
+                    OPENAI_API_KEY = st.secrets[key]
+                    st.sidebar.success(f"✅ API Key encontrada como {key}")
+                elif "api_keys" in st.secrets and key in st.secrets["api_keys"]:
+                    OPENAI_API_KEY = st.secrets["api_keys"][key]
+                    st.sidebar.success(f"✅ API Key encontrada en api_keys.{key}")
+
+        if not ASSISTANT_ID:
+            alternative_ids = ["assistant_id", "AssistantID", "ASSISTANT"]
+            for key in alternative_ids:
+                if key in st.secrets:
+                    ASSISTANT_ID = st.secrets[key]
+                    st.sidebar.success(f"✅ Assistant ID encontrado como {key}")
+                elif "api_keys" in st.secrets and key in st.secrets["api_keys"]:
+                    ASSISTANT_ID = st.secrets["api_keys"][key]
+                    st.sidebar.success(f"✅ Assistant ID encontrado en api_keys.{key}")
+
+    except Exception as e:
+        st.sidebar.error(f"Error accediendo a secrets: {str(e)}")
+
+    # Si no se encontraron credenciales, solicitar manualmente
     if not OPENAI_API_KEY:
         OPENAI_API_KEY = st.sidebar.text_input("OpenAI API Key", type="password")
 
     if not ASSISTANT_ID:
         ASSISTANT_ID = st.sidebar.text_input("Assistant ID", type="password")
 
-    # Si falta alguna credencial, mostrar error
+    # Si aún no hay credenciales, retornar None
     if not OPENAI_API_KEY or not ASSISTANT_ID:
         return None, None
 
     # Configurar cliente OpenAI
-    openai.api_key = OPENAI_API_KEY
+    client = openai
+    client.api_key = OPENAI_API_KEY
 
     # Inicializar variables de estado para el thread
     if "thread_id" not in st.session_state:
-        thread = openai.beta.threads.create()
-        st.session_state.thread_id = thread.id
+        try:
+            thread = client.beta.threads.create()
+            st.session_state.thread_id = thread.id
+        except Exception as thread_error:
+            st.sidebar.error(f"Error creando thread: {str(thread_error)}")
+            return None, None
 
-    return openai, ASSISTANT_ID
+    return client, ASSISTANT_ID
 
 
 def process_message_with_citations(message):
@@ -353,6 +414,21 @@ def consult_expert_ia(client, assistant_id, recommendation, symbol):
     if not client or not assistant_id:
         return "Error: No se ha configurado correctamente el Experto IA. Por favor, verifica las credenciales de OpenAI."
 
+    # Definir un serializador personalizado para tipos NumPy
+    class NumpyEncoder(json.JSONEncoder):
+        """Encoder personalizado para manejar tipos de datos NumPy en la serialización JSON"""
+
+        def default(self, obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            return super(NumpyEncoder, self).default(obj)
+
     # Formatear la información del análisis como un mensaje
     prompt = f"""
     Por favor, analiza el siguiente activo financiero y proporciona tu opinión profesional:
@@ -366,16 +442,16 @@ def consult_expert_ia(client, assistant_id, recommendation, symbol):
     - Horizonte temporal: {recommendation.get('timeframe')}
     
     Factores técnicos:
-    {json.dumps(recommendation.get('technical_factors', {}), indent=2)}
+    {json.dumps(recommendation.get('technical_factors', {}), indent=2, cls=NumpyEncoder)}
     
     Factores fundamentales:
-    {json.dumps(recommendation.get('fundamental_factors', {}), indent=2)}
+    {json.dumps(recommendation.get('fundamental_factors', {}), indent=2, cls=NumpyEncoder)}
     
     Análisis de sentimiento:
-    {json.dumps(recommendation.get('news_sentiment', {}), indent=2)}
+    {json.dumps(recommendation.get('news_sentiment', {}), indent=2, cls=NumpyEncoder)}
     
     Análisis web:
-    {json.dumps(recommendation.get('web_analysis', {}), indent=2)}
+    {json.dumps(recommendation.get('web_analysis', {}), indent=2, cls=NumpyEncoder)}
     
     Por favor proporciona:
     1. Tu evaluación del activo considerando todos los aspectos (técnico, fundamental y sentimiento)
